@@ -9,6 +9,12 @@ import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.background
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.buildAnnotatedString
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.withStyle
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.isSystemInDarkTheme
@@ -375,7 +381,11 @@ private fun DetailScreen(address: Address, onBack: () -> Unit) {
 							.apply { timeZone = TimeZone.getTimeZone("Europe/Kyiv") }
 						Text("На сьогодні ${fmt.format(Date(it * 1000))}", fontSize = 16.sp)
 					}
-					if (s.updatedAt.isNotBlank()) Text("Оновлено: ${s.updatedAt}", fontSize = 13.sp)
+					if (s.subType.isNotEmpty() || s.startDate.isNotEmpty() || s.endDate.isNotEmpty()) {
+						OutageInfo(s)
+					} else if (s.updatedAt.isNotBlank()) {
+						Text("Оновлено: ${s.updatedAt}", fontSize = 13.sp)
+					}
 					Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
 						HoursTable(s.hours, from = 0, modifier = Modifier.weight(1f))
 						HoursTable(s.hours, from = 12, modifier = Modifier.weight(1f))
@@ -385,6 +395,43 @@ private fun DetailScreen(address: Address, onBack: () -> Unit) {
 			}
 		}
 		Button(onClick = onBack, modifier = Modifier.fillMaxWidth()) { Text("Повернутись на головну") }
+	}
+}
+
+/** Жовта плашка з поясненням про поточне відключення */
+@Composable
+private fun OutageInfo(s: Schedule) {
+	val bold = SpanStyle(fontWeight = FontWeight.Bold)
+	fun line(label: String, value: String, prefix: String = "") = buildAnnotatedString {
+		append(label)
+		if (prefix.isNotEmpty()) append(prefix)
+		withStyle(bold) { append(value) }
+	}
+
+	val update = s.updateTimestamp.ifEmpty { s.updatedAt }
+	// Текст завжди темний, бо плашка жовта в будь-якій темі
+	val textColor = Color(0xFF4A4A4A)
+	Column(
+		Modifier
+			.fillMaxWidth()
+			.background(Color(0xFFFFF7B3), RoundedCornerShape(8.dp))
+			.border(1.dp, Color(0xFFD9D4A0), RoundedCornerShape(8.dp))
+			.padding(16.dp),
+		verticalArrangement = Arrangement.spacedBy(4.dp),
+	) {
+		Text("За вашою адресою в даний момент відсутня електроенергія", color = textColor, fontSize = 14.sp)
+		if (s.subType.isNotEmpty()) Text(line("Причина: ", s.subType), color = textColor, fontSize = 14.sp)
+		if (s.startDate.isNotEmpty()) Text(line("Час початку – ", s.startDate), color = textColor, fontSize = 14.sp)
+		if (s.endDate.isNotEmpty()) {
+			Text(
+				line("Орієнтовний час відновлення електроенергії – ", "до ${s.endDate}"),
+				color = textColor, fontSize = 14.sp,
+			)
+		}
+		if (update.isNotEmpty()) {
+			Spacer(Modifier.height(8.dp))
+			Text("Дата оновлення інформації – $update", color = textColor, fontSize = 14.sp)
+		}
 	}
 }
 

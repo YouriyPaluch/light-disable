@@ -25,6 +25,11 @@ data class Address(val city: String, val street: String, val house: String) {
 class Schedule(
 	val dateTs: Long?,
 	val updatedAt: String,
+	/** Дані про відключення з даних будинку; порожні, якщо їх немає */
+	val subType: String,
+	val startDate: String,
+	val endDate: String,
+	val updateTimestamp: String,
 	/** 24 значення для годин 1..24: no / yes / first / second */
 	val hours: List<String>,
 )
@@ -82,6 +87,10 @@ object Dtek {
 		File(context.cacheDir, "shutdowns.html").delete()
 	}
 
+	/** Рядкове значення поля; порожній рядок, якщо поля немає або воно null */
+	private fun text(o: JSONObject, key: String): String =
+		if (o.isNull(key)) "" else o.optString(key, "").trim()
+
 	private fun fetchPage(context: Context): String {
 		val html = request("$BASE/shutdowns", null, null)
 		File(context.cacheDir, "shutdowns.html").writeText(html)
@@ -122,6 +131,10 @@ object Dtek {
 			Schedule(
 				dateTs = tsKey.toLongOrNull(),
 				updatedAt = fact.optString("update"),
+				subType = text(house, "sub_type"),
+				startDate = text(house, "start_date"),
+				endDate = text(house, "end_date"),
+				updateTimestamp = text(json, "updateTimestamp").ifEmpty { text(fact, "updateTimestamp") },
 				hours = (1..24).map { hoursJson.optString(it.toString(), "yes") },
 			)
 		}
