@@ -28,7 +28,10 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.requiredWidth
+import androidx.compose.ui.draw.clip
 import androidx.compose.foundation.layout.size
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -65,6 +68,7 @@ import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.lightDisable.ui.theme.ГрафікВідключеньTheme
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.launch
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -159,6 +163,7 @@ fun App(themeMode: ThemeMode, onThemeMode: (ThemeMode) -> Unit) {
 					onDelete = {
 						addresses = addresses - it
 						store.save(addresses)
+						ScheduleStore(context).remove(it)
 					},
 				)
 
@@ -353,12 +358,28 @@ private fun DetailScreen(address: Address, onBack: () -> Unit) {
 	val context = LocalContext.current
 	var schedule by remember { mutableStateOf<Schedule?>(null) }
 	var error by remember { mutableStateOf<String?>(null) }
+	// Час збереження, якщо показані дані з пам'яті, і причина невдачі оновлення
+	var cachedAt by remember { mutableStateOf<Long?>(null) }
+	var refreshError by remember { mutableStateOf<String?>(null) }
+	var showTomorrow by remember { mutableStateOf(false) }
 
 	LaunchedEffect(address) {
+		val store = ScheduleStore(context)
 		try {
-			schedule = Dtek.schedule(context, address)
+			val fresh = Dtek.schedule(context, address)
+			store.save(address, fresh)
+			schedule = fresh
+		} catch (e: CancellationException) {
+			throw e
 		} catch (e: Exception) {
-			error = "Не вдалося отримати графік: ${e.message}"
+			val cached = store.load(address)
+			if (cached != null) {
+				schedule = cached.first
+				cachedAt = cached.second
+				refreshError = e.message
+			} else {
+				error = "Не вдалося отримати графік: ${e.message}"
+			}
 		}
 	}
 
@@ -376,25 +397,79 @@ private fun DetailScreen(address: Address, onBack: () -> Unit) {
 				error != null -> Text(error!!, color = MaterialTheme.colorScheme.error)
 				s == null -> CircularProgressIndicator()
 				else -> {
-					s.dateTs?.let {
-						val fmt = SimpleDateFormat("dd.MM.yy", Locale.US)
-							.apply { timeZone = TimeZone.getTimeZone("Europe/Kyiv") }
-						Text("На сьогодні ${fmt.format(Date(it * 1000))}", fontSize = 16.sp)
+					cachedAt?.let { StaleBanner(it, refreshError) }
+					val tomorrow = s.tomorrow
+					val viewingTomorrow = showTomorrow && tomorrow != null
+					val day = if (viewingTomorrow) tomorrow!! else s.today
+					fun dm(d: Day) = d.dateTs?.let { Kyiv.format("dd.MM.yy", it * 1000) }.orEmpty()
+
+					day.dateTs?.let {
+						// дата + назва дня тижня з preset.days
+						val date = dm(day) + s.preset.dayName(it * 1000).let { n -> if (n.isEmpty()) "" else ", $n" }
+						// Збережені дані можуть бути за іншу дату — тоді не пишемо «на сьогодні»
+						val isToday = !viewingTomorrow && Kyiv.format("dd.MM.yy", it * 1000) == Kyiv.format("dd.MM.yy", System.currentTimeMillis())
+						Text(
+							when {
+								viewingTomorrow -> "На завтра $date"
+								isToday -> "На сьогодні $date"
+								else -> "Графік на $date"
+							},
+							fontSize = 16.sp,
+						)
 					}
-					if (s.subType.isNotEmpty() || s.startDate.isNotEmpty() || s.endDate.isNotEmpty()) {
-						OutageInfo(s)
-					} else if (s.updatedAt.isNotBlank()) {
-						Text("Оновлено: ${s.updatedAt}", fontSize = 13.sp)
+					if (tomorrow != null) {
+						Button(onClick = { showTomorrow = !viewingTomorrow }, modifier = Modifier.fillMaxWidth()) {
+							Text(
+								if (viewingTomorrow) "Графік на сьогодні (${dm(s.today)})"
+								else "Графік на завтра (${dm(tomorrow)})"
+							)
+						}
 					}
-					Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-						HoursTable(s.hours, from = 0, modifier = Modifier.weight(1f))
-						HoursTable(s.hours, from = 12, modifier = Modifier.weight(1f))
+					// Жовта плашка — лише для поточного дня
+					if (!viewingTomorrow) {
+						if (s.subType.isNotEmpty() || s.startDate.isNotEmpty() || s.endDate.isNotEmpty()) {
+							OutageInfo(s)
+						} else if (s.updatedAt.isNotBlank()) {
+							Text("Оновлено: ${s.updatedAt}", fontSize = 13.sp)
+						}
 					}
-					Legend()
+					OutageList(s.schName, day.hours, s.preset)
+					// Дві таблиці по 30% ширини екрану; три однакові проміжки (край — таблиця — таблиця — край)
+					// по (100% - 60%) / 3. requiredWidth розтягує ряд на весь екран, поміч із відступу 16dp.
+					val screenW = LocalConfiguration.current.screenWidthDp.dp
+					val tableW = screenW * 0.3f
+					val gap = screenW * 0.4f / 3
+					Row(
+						Modifier.requiredWidth(screenW).padding(horizontal = gap),
+						horizontalArrangement = Arrangement.spacedBy(gap),
+					) {
+						HoursTable(day.hours, s.preset, from = 0, modifier = Modifier.width(tableW))
+						HoursTable(day.hours, s.preset, from = 12, modifier = Modifier.width(tableW))
+					}
+					Legend(day.hours.toSet(), s.preset)
 				}
 			}
 		}
 		Button(onClick = onBack, modifier = Modifier.fillMaxWidth()) { Text("Повернутись на головну") }
+	}
+}
+
+/** Червона плашка: показані збережені дані, оновити не вдалося */
+@Composable
+private fun StaleBanner(savedAt: Long, reason: String?) {
+	val fmt = SimpleDateFormat("dd.MM.yyyy HH:mm", Locale.US)
+		.apply { timeZone = TimeZone.getTimeZone("Europe/Kyiv") }
+	val textColor = Color(0xFF8C1D18)
+	Column(
+		Modifier
+			.fillMaxWidth()
+			.background(Color(0xFFFFDAD6), RoundedCornerShape(8.dp))
+			.border(1.dp, Color(0xFFE5A09B), RoundedCornerShape(8.dp))
+			.padding(16.dp),
+		verticalArrangement = Arrangement.spacedBy(4.dp),
+	) {
+		Text("Не вдалося отримати актуальні дані. Відображено збережені дані від ${fmt.format(Date(savedAt))}", color = textColor, fontSize = 14.sp, fontWeight = FontWeight.Bold)
+		if (!reason.isNullOrBlank()) Text("Причина: $reason", color = textColor, fontSize = 12.sp)
 	}
 }
 
@@ -435,17 +510,56 @@ private fun OutageInfo(s: Schedule) {
 	}
 }
 
+/** Відрізки часу «світла не буде» за 24 годинами дня; «maybe» у список не входить */
+private fun outageIntervals(hours: List<String>, preset: Preset): List<String> {
+	val off = BooleanArray(48)
+	hours.take(24).forEachIndexed { h, v ->
+		when (v) {
+			"no" -> { off[2 * h] = true; off[2 * h + 1] = true }
+			"first" -> off[2 * h] = true
+			"second" -> off[2 * h + 1] = true
+		}
+	}
+	fun t(slot: Int) = preset.slotTime(slot)
+	val result = mutableListOf<String>()
+	var i = 0
+	while (i < 48) {
+		if (off[i]) {
+			val start = i
+			while (i < 48 && off[i]) i++
+			result += "${t(start)} - ${t(i)}"
+		} else i++
+	}
+	return result
+}
+
+/** Заголовок черги і список відрізків, коли світла не буде */
+@Composable
+private fun OutageList(title: String, hours: List<String>, preset: Preset) {
+	val intervals = outageIntervals(hours, preset)
+	Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+		Text(title, fontSize = 18.sp, fontWeight = FontWeight.Bold)
+		if (intervals.isEmpty()) {
+			Text("Повністю без відключень", fontSize = 15.sp)
+		} else {
+			Text("⚡️ Світла не буде:", fontSize = 15.sp)
+			intervals.forEach { Text("☑️$it", fontSize = 15.sp) }
+		}
+	}
+}
+
 private val OffColor = Color(0xFFD3D4D5)
 private val IconColor = Color(0xFF11203E)
 
 /** Таблиця 2 стовпці × 13 рядків: заголовок + 12 годин, починаючи з [from] */
 @Composable
-private fun HoursTable(hours: List<String>, from: Int, modifier: Modifier = Modifier) {
-	Column(modifier.border(1.dp, Color.Gray)) {
+private fun HoursTable(hours: List<String>, preset: Preset, from: Int, modifier: Modifier = Modifier) {
+	val shape = RoundedCornerShape(8.dp)
+	Column(modifier.clip(shape).border(1.dp, Color.Gray, shape)) {
 		TableRow("Час", null)
 		for (h in from until from + 12) {
 			// ключ "1".."24" у відповіді = година (h-1)..h, тобто індекс h у списку
-			TableRow("%02d-%02d".format(h, h + 1), hours.getOrElse(h) { "yes" })
+			TableRow(preset.hourLabel(h), hours.getOrElse(h) { "yes" })
 		}
 	}
 }
@@ -454,7 +568,7 @@ private fun HoursTable(hours: List<String>, from: Int, modifier: Modifier = Modi
 private fun TableRow(label: String, value: String?) {
 	Row(Modifier.fillMaxWidth().height(32.dp)) {
 		Box(
-			Modifier.width(56.dp).fillMaxHeight().border(0.5.dp, Color.Gray),
+			Modifier.width(48.dp).fillMaxHeight().border(0.5.dp, Color.Gray),
 			contentAlignment = Alignment.Center,
 		) { Text(label, fontSize = 12.sp) }
 		Box(Modifier.weight(1f).fillMaxHeight().border(0.5.dp, Color.Gray)) {
@@ -474,12 +588,13 @@ private fun LightCell(value: String, modifier: Modifier = Modifier) {
 	val painter = painterResource(R.drawable.ic_power_off)
 	val baseIconColor = MaterialTheme.colorScheme.onBackground
 	Canvas(modifier) {
-		if (value != "no" && value != "first" && value != "second" && value != "maybe") return@Canvas
+		if (value !in setOf("no", "first", "second", "maybe", "mfirst", "msecond")) return@Canvas
 		val w = size.width
 		val h = size.height
-		val alpha = if (value == "maybe") 0.5f else 1f
-		val greyLeft = if (value == "second") w / 2 else 0f
-		val greyRight = if (value == "first") w / 2 else w
+		// maybe / mfirst / msecond — так само, як no / first / second, але з прозорістю 50%
+		val alpha = if (value == "maybe" || value == "mfirst" || value == "msecond") 0.5f else 1f
+		val greyLeft = if (value == "second" || value == "msecond") w / 2 else 0f
+		val greyRight = if (value == "first" || value == "mfirst") w / 2 else w
 
 		drawRect(OffColor, Offset(greyLeft, 0f), Size(greyRight - greyLeft, h), alpha)
 
@@ -498,16 +613,12 @@ private fun LightCell(value: String, modifier: Modifier = Modifier) {
 	}
 }
 
+/** Легенда лише для значень, які фактично є в таблиці */
 @Composable
-private fun Legend() {
+private fun Legend(used: Set<String>, preset: Preset) {
 	Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-		listOf(
-			"yes" to "Світло є",
-			"no" to "Світла немає",
-			"first" to "Світла немає перші 30 хв.",
-			"second" to "Світла немає другі 30 хв.",
-			"maybe" to "Можливе відключення",
-		).forEach { (key, text) ->
+		// Підписи беруться з preset.time_type у відповіді сайту
+		preset.legendKeys().filter { it in used }.map { it to preset.typeText(it) }.forEach { (key, text) ->
 			Row(verticalAlignment = Alignment.CenterVertically) {
 				Box(Modifier.size(32.dp, 24.dp).border(0.5.dp, Color.Gray)) {
 					LightCell(key, Modifier.fillMaxSize())

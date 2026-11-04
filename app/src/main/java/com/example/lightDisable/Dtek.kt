@@ -22,17 +22,6 @@ data class Address(val city: String, val street: String, val house: String) {
 	val title: String get() = "$city, $street, $house"
 }
 
-class Schedule(
-	val dateTs: Long?,
-	val updatedAt: String,
-	/** Дані про відключення з даних будинку; порожні, якщо їх немає */
-	val subType: String,
-	val startDate: String,
-	val endDate: String,
-	val updateTimestamp: String,
-	/** 24 значення для годин 1..24: no / yes / first / second */
-	val hours: List<String>,
-)
 
 object Dtek {
 	private const val BASE = "https://www.dtek-dnem.com.ua/ua"
@@ -91,6 +80,45 @@ object Dtek {
 	private fun text(o: JSONObject, key: String): String =
 		if (o.isNull(key)) "" else o.optString(key, "").trim()
 
+	/** Рекурсивний пошук об'єкта з ключем [key] у будь-якому місці JSON */
+	private fun findObject(node: Any?, key: String): JSONObject? {
+		when (node) {
+			is JSONObject -> {
+				node.optJSONObject(key)?.let { return it }
+				for (k in node.keys()) findObject(node.opt(k), key)?.let { return it }
+			}
+
+			is JSONArray -> for (i in 0 until node.length()) findObject(node.opt(i), key)?.let { return it }
+		}
+		return null
+	}
+
+	/** preset.time_type (підписи значень) і preset.time_zone (годинні проміжки «ключ 1..24 -> [підпис, початок, кінець]») */
+	private fun parsePreset(preset: JSONObject?): Preset {
+		if (preset == null) return Preset.EMPTY
+		val types = preset.optJSONObject("time_type")
+		val zones = preset.optJSONObject("time_zone")
+		return Preset(
+			timeTypes = types?.keys()?.asSequence()?.associateWith { types.optString(it) }.orEmpty(),
+			// Рівно 24 проміжки або нічого (тоді будуть значення за замовчуванням)
+			zones = (1..24).mapNotNull { zones?.optJSONArray(it.toString()) }
+				.map { Zone(it.optString(0), it.optString(1), it.optString(2)) }
+				.let { if (it.size == 24) it else emptyList() },
+			days = preset.optJSONObject("days")?.let { d -> d.keys().asSequence().associateWith { d.optString(it) } }.orEmpty(),
+		)
+	}
+
+	private fun schName(names: JSONObject?, reason: String): String =
+		if (names == null || names.isNull(reason)) "" else names.optString(reason, "").trim()
+
+	/** sch_names з закешованої сторінки /shutdowns (запасний варіант) */
+	private fun schNamesFromPage(context: Context): JSONObject? = try {
+		val html = File(context.cacheDir, "shutdowns.html").readText()
+		Regex(""""sch_names"\s*:\s*(\{[^{}]*\})""").find(html)?.let { JSONObject(it.groupValues[1]) }
+	} catch (e: Exception) {
+		null
+	}
+
 	private fun fetchPage(context: Context): String {
 		val html = request("$BASE/shutdowns", null, null)
 		File(context.cacheDir, "shutdowns.html").writeText(html)
@@ -108,7 +136,8 @@ object Dtek {
 		load(context)
 		return withContext(Dispatchers.IO) {
 			val data = ajax(city, street).optJSONObject("data") ?: return@withContext emptyList()
-			data.keys().asSequence().toList().sortedWith(compareBy({ leadingNumber(it) }, { it }))
+			// У data можуть бути й службові поля (напр. updateTimestamp) — беремо лише ключі з об'єктами будинків
+			data.keys().asSequence().filter { data.optJSONObject(it) != null }.toList().sortedWith(compareBy({ leadingNumber(it) }, { it }))
 		}
 	}
 
@@ -117,25 +146,44 @@ object Dtek {
 		load(context, force = true)
 		return withContext(Dispatchers.IO) {
 			val json = ajax(address.city, address.street)
-			val house = json.optJSONObject("data")?.optJSONObject(address.house)
+			val data = json.optJSONObject("data") ?: throw IOException("Параметр data відсутній")
+			val house = data.optJSONObject(address.house)
 				?: throw IOException("Будинок ${address.house} не знайдено у відповіді")
 			val r = house.opt("sub_type_reason")
 			val reason = if (r is JSONArray) r.optString(0) else house.optString("sub_type_reason", "")
 			if (reason.isEmpty()) throw IOException("sub_type_reason відсутній")
 			val fact = json.optJSONObject("fact") ?: throw IOException("Параметр fact відсутній")
 			val factData = fact.optJSONObject("data") ?: throw IOException("fact.data відсутній")
-			val tsKey = factData.keys().asSequence().firstOrNull()
-				?: throw IOException("fact.data порожній")
-			val hoursJson = factData.getJSONObject(tsKey).optJSONObject(reason)
-				?: throw IOException("Немає графіка для $reason")
+			val keys = factData.keys().asSequence().toList()
+			if (keys.isEmpty()) throw IOException("fact.data порожній")
+			fun keyDate(k: String) = k.toLongOrNull()?.let { Kyiv.dateKey(it * 1000) }
+			// Сьогодні — ключ з датою сьогодні (або перший ключ), завтра — ключ з датою завтра
+			val todayKey = keys.firstOrNull { keyDate(it) == Kyiv.dateKey(System.currentTimeMillis()) } ?: keys.first()
+			val tomorrowKey = keys.firstOrNull { keyDate(it) == Kyiv.dateKeyPlusDays(1) && it != todayKey }
+			fun day(k: String): Day? {
+				val h = factData.optJSONObject(k)?.optJSONObject(reason) ?: return null
+				return Day(k.toLongOrNull(), (1..24).map { h.optString(it.toString(), "yes") })
+			}
+			val today = day(todayKey) ?: throw IOException("Немає графіка для $reason")
+			val tomorrow = tomorrowKey?.let { day(it) }
+			// Назва черги: preset.sch_names (запасно — будь-де у відповіді, потім у кешованій сторінці),
+			// інакше сам sub_type_reason
+			val presetJson = json.optJSONObject("preset")
+			val schName = schName(presetJson?.optJSONObject("sch_names") ?: findObject(json, "sch_names"), reason)
+				.ifEmpty { schName(schNamesFromPage(context), reason) }
+				.ifEmpty { reason }
 			Schedule(
-				dateTs = tsKey.toLongOrNull(),
+				today = today,
+				tomorrow = tomorrow,
+				schName = schName,
 				updatedAt = fact.optString("update"),
 				subType = text(house, "sub_type"),
 				startDate = text(house, "start_date"),
 				endDate = text(house, "end_date"),
-				updateTimestamp = text(json, "updateTimestamp").ifEmpty { text(fact, "updateTimestamp") },
-				hours = (1..24).map { hoursJson.optString(it.toString(), "yes") },
+				updateTimestamp = text(data, "updateTimestamp")
+					.ifEmpty { text(json, "updateTimestamp") }
+					.ifEmpty { text(fact, "updateTimestamp") },
+				preset = parsePreset(presetJson),
 			)
 		}
 	}
@@ -233,3 +281,4 @@ class AddressStore(context: Context) {
 		prefs.edit().putString("list", arr.toString()).apply()
 	}
 }
+
