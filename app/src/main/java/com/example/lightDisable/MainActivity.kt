@@ -2,10 +2,14 @@ package com.example.lightDisable
 
 import android.content.Context
 import android.graphics.Color as AndroidColor
+import android.os.Build
 import android.os.Bundle
+import android.Manifest
 import androidx.activity.ComponentActivity
 import androidx.activity.SystemBarStyle
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.Canvas
@@ -85,6 +89,8 @@ class MainActivity : ComponentActivity() {
 	override fun onCreate(savedInstanceState: Bundle?) {
 		super.onCreate(savedInstanceState)
 		Dtek.clear(this) // очищення при вході
+		NotificationHelper.createNotificationChannel(this)
+		ScheduleManager.scheduleNextNormalUpdate(this)
 		enableEdgeToEdge()
 		val settings = getSharedPreferences("settings", Context.MODE_PRIVATE)
 		setContent {
@@ -148,6 +154,16 @@ fun App(themeMode: ThemeMode, onThemeMode: (ThemeMode) -> Unit) {
 	val store = remember { AddressStore(context) }
 	var addresses by remember { mutableStateOf(store.load()) }
 	var screen by remember { mutableStateOf<Screen>(Screen.Home) }
+
+	if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+		val launcher = rememberLauncherForActivityResult(
+			contract = ActivityResultContracts.RequestPermission(),
+			onResult = {}
+		)
+		LaunchedEffect(Unit) {
+			launcher.launch(Manifest.permission.POST_NOTIFICATIONS)
+		}
+	}
 
 	BackHandler(enabled = screen != Screen.Home) { screen = Screen.Home }
 
@@ -369,6 +385,8 @@ private fun DetailScreen(address: Address, onBack: () -> Unit) {
 			val fresh = Dtek.schedule(context, address)
 			store.save(address, fresh)
 			schedule = fresh
+			ScheduleManager.recordSuccessfulFetch(context)
+			NotificationHelper.rescheduleAllNotifications(context)
 		} catch (e: CancellationException) {
 			throw e
 		} catch (e: Exception) {
